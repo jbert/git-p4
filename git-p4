@@ -811,6 +811,7 @@ class P4Submit(Command):
         Command.__init__(self)
         self.options = [
                 optparse.make_option("--verbose", dest="verbose", action="store_true"),
+                optparse.make_option("--dry-run", dest="dryRun", action="store_true"),
                 optparse.make_option("--origin", dest="origin"),
                 optparse.make_option("--auto", dest="interactive", action="store_false", help="Automatically submit changelists without requiring editing"),
                 optparse.make_option("-M", dest="detectRename", action="store_true", help="detect renames"),
@@ -829,6 +830,7 @@ class P4Submit(Command):
         if gitConfig("git-p4.detectCopy") == "true":
             self.detectCopy = True
         self.verbose = False
+        self.dryRun = False
         self.isWindows = (platform.system() == "Windows")
         self.importIntoRemotes = True
         if gitConfig("git-p4.importIntoRemotes") == "false":
@@ -1158,6 +1160,12 @@ class P4Submit(Command):
 
         if self.verbose:
             print "Commits to apply: %s" % self.commits
+
+        if self.dryRun:
+            print "Would submit"
+            for commit in self.commits:
+                print (read_pipe("git log --max-count=1 --pretty=oneline %s" % commit))
+            return True
 
         self.applyCommits()
         
