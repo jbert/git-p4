@@ -125,8 +125,7 @@ class P4Helper:
         # the execute bit setting in the passed in mode.
 
         p4Type = "+x"
-        if p4Type == '+x':
-          p4Type = 'text+x'
+
         if not isModeExec(mode):
             p4Type = self.getP4OpenedType(file)
             p4Type = re.sub('^([cku]?)x(.*)', '\\1\\2', p4Type)
@@ -716,7 +715,8 @@ class P4FileReader:
 
             if includeFile and not excludeFile:
                 self.filesForCommit.append(f)
-                self.pathMap[f['path']] = f
+                self.pathMap[f["path"]] = f
+                self.pathMap[f["targetPath"]] = f
                 if f['action'] not in ('delete', 'purge', 'move/delete'):
                     self.filesToRead.append(f)
 
@@ -1208,7 +1208,13 @@ class P4Sync(Command):
                 optparse.make_option("--no-getuserlist", dest="getUserList", action='store_false',
                                      help="Don't get the list of users from Perforce if a commit author can't be found. Trust cached userlist instead."),
                 optparse.make_option("--fuzzy-tags", dest="fuzzyTags", action='store_true',
-                                     help="Create tag even if number of files doesn't match when all revisions of files in tag match.")
+                                     help="Create tag even if number of files doesn't match as long as all revisions of files in tag match."),
+                optparse.make_option("--tree-filter", dest="treeFilter", action='store',
+                                     help="Filter to apply to file names"),
+                optparse.make_option("--msg-filter", dest="msgFilter", action='store',
+                                     help="Filter to apply to commit message"),
+                optparse.make_option("--content-filter", dest="contentFilter", action='store',
+                                     help="Filter to apply to file content"),
         ]
         self.description = """Imports from Perforce into a git repository.\n
     example:
@@ -1250,11 +1256,17 @@ class P4Sync(Command):
         self.previousDepotPaths = []
         self.getUserList = True
         self.fuzzyTags = False
-        self.branchCommits = {} # last committed change (mark number) on a branch
         self.changeListCommits = {} # changelist numbers and corresponding marks
+        self.treeFilter = ""
+        self.msgFilter = ""
+        self.contentFilter = ""
+        self.contentFilterDir = ""
 
         self.knownBranches = {}
         self.initialParents = {}
+
+        self.lastLabelChange = 0 # changelist# of last processed label
+        self.lastLabelFiles = [] # files included in last processed label
         
         if gitConfig("git-p4.syncFromOrigin") == "false":
             self.syncWithOrigin = False
@@ -1262,10 +1274,11 @@ class P4Sync(Command):
     def extractFilesFromCommit(self, commit):
         self.cloneExclude = [re.sub(r"\.\.\.$", "", path)
                              for path in self.cloneExclude]
-        files = []
+        tmpFiles = []
+        filesString = ''
         fnum = 0
         while commit.has_key("depotFile%s" % fnum):
-            path =  commit["depotFile%s" % fnum]
+            path = commit["depotFile%s" % fnum]
 
             if [p for p in self.cloneExclude
                 if path.startswith (p)]:
@@ -1273,17 +1286,27 @@ class P4Sync(Command):
             else:
                 found = [p for p in self.depotPaths
                          if path.startswith (p)]
-            if not found:
-                fnum = fnum + 1
-                continue
 
-            f = {}
-            f["path"] = path
-            f["rev"] = commit["rev%s" % fnum]
-            f["action"] = commit["action%s" % fnum]
-            f["type"] = commit["type%s" % fnum]
-            files.append(f)
-            fnum = fnum + 1
+            if found:
+                filesString += path + '\n'
+                f = {}
+                f["path"] = path
+                f["rev"] = commit["rev%s" % fnum]
+                f["action"] = commit["action%s" % fnum]
+                f["type"] = commit["type%s" % fnum]
+                tmpFiles.append(f)
+            fnum += 1
+
+        filteredFiles = self.applyFilter(self.treeFilter, filesString).split('\n')
+
+        files = []
+        i = 0
+        for file in filteredFiles:
+            if file:
+                f = tmpFiles[i]
+                f["targetPath"] = file
+                files.append(f)
+            i += 1
         return files
 
     def stripRepoPath(self, path, prefixes):
@@ -1297,24 +1320,36 @@ class P4Sync(Command):
         return path
 
     def splitFilesIntoBranches(self, commit):
-        branches = {}
+        files = []
+        filesString = ''
         fnum = 0
         while commit.has_key("depotFile%s" % fnum):
             path =  commit["depotFile%s" % fnum]
             found = [p for p in self.depotPaths
                      if path.startswith (p)]
-            if not found:
-                fnum = fnum + 1
+
+            if found:
+                f = {}
+                f["path"] = path
+                f["rev"] = commit["rev%s" % fnum]
+                f["action"] = commit["action%s" % fnum]
+                f["type"] = commit["type%s" % fnum]
+                files.append(f)
+                filesString += path + '\n'
+            fnum += 1
+
+        filteredFiles = self.applyFilter(self.treeFilter, filesString).split('\n')
+
+        branches = {}
+        i = 0
+        for targetPath in filteredFiles:
+            f = files[i]
+            f["targetPath"] = targetPath
+            i += 1
+            if not targetPath:
                 continue
 
-            f = {}
-            f["path"] = path
-            f["rev"] = commit["rev%s" % fnum]
-            f["action"] = commit["action%s" % fnum]
-            f["type"] = commit["type%s" % fnum]
-            fnum = fnum + 1
-
-            relPath = self.stripRepoPath(path, self.depotPaths)
+            relPath = self.stripRepoPath(targetPath, self.depotPaths)
 
             for branch in self.knownBranches.keys():
 
@@ -1398,7 +1433,51 @@ class P4Sync(Command):
 
         return filesForCommit
 
-    def commit(self, details, files, branch, branchPrefixes, parent = "", noteParent = ""):
+    def applyFilter(self, filter, path, cwd=os.getcwd(), env=os.environ.copy()):
+        if not filter:
+            return path
+
+        # The tree filter is a script that gets the path of one or more files (in p4 notation, e.g. //depot/branch/file.txt)
+        # on stdin. It can output a modified path on stdout, or return an empty string to ignore this file.
+        # The msg filter is a script that gets the commit message on stdin and returns
+        # a modified commit message.
+        # The content filter gets called for text files and is passed the name of a temporary file on stdin and can modify that.
+        filterProc = subprocess.Popen(filter, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True, env=env, cwd=cwd)
+        output = filterProc.communicate(path)[0]
+        return output.rstrip()
+
+    def applyContentFilter(self, filter, data):
+        if not filter:
+            return data
+
+        tmpfile = tempfile.NamedTemporaryFile(dir=self.contentFilterDir, delete=False)
+        try:
+            fileName = tmpfile.name
+            tmpfile.write(data)
+            tmpfile.close()
+            env = os.environ.copy()
+            env["GIT_DIR"] = self.contentFilterDir
+            self.applyFilter(filter, fileName, self.contentFilterDir, env)
+            handle = open(fileName, "r")
+            data = handle.read()
+            handle.close
+            os.remove(fileName)
+            return data
+        except:
+            try:
+                os.remove(fileName)
+            except:
+                pass
+            return None
+
+    def commit(self, details, files, branch, branchPrefixes, parent = "", noteParent = "", filterBranchPrefixes = True):
+        # If the commit doesn't have any files (e.g. because all files got filtered out)
+        # we ignore the commit. Note that we still get a merge commit because p4 reports
+        # all files that were involved in the merge, so len(files) > 0.
+        if len(files) == 0:
+            print "no files to commit -- ignoring"
+            return
+
         epoch = details["time"]
         author = details["user"]
         change = int(details["change"])
@@ -1406,15 +1485,29 @@ class P4Sync(Command):
         if self.verbose:
             print "commit into %s" % branch
 
+        if filterBranchPrefixes:
+            # need to apply tree filter to branchPrefixes as well!
+            filteredBranchPrefixes = []
+            for p in branchPrefixes:
+                filteredBranchPrefixes.append(self.applyFilter(self.treeFilter, p))
+        else:
+            filteredBranchPrefixes = branchPrefixes
+
         # start with reading files; if that fails, we should not
         # create a commit.
         new_files = []
         for f in files:
-            if [p for p in branchPrefixes if f['path'].startswith(p)]:
+            if [p for p in filteredBranchPrefixes if f["targetPath"].startswith(p)]:
                 new_files.append (f)
             else:
-                sys.stderr.write("Ignoring file outside of prefix: %s\n" % f['path'])
-        #files = self.readP4Files(new_files)
+                sys.stderr.write("Ignoring file outside of prefix: %s (mapped to %s)\n" % (f["path"], f["targetPath"]))
+
+        isMergeCommit = self.detectBranches and self.isMergeCommit(new_files)
+        if isMergeCommit:
+            # make fast-import flush all changes to disk and update the refs using the checkpoint
+            # command so that we can try to find the branch parent in the git history
+            self.gitStream.write("checkpoint\n\n");
+            self.gitStream.flush();
 
         self.gitStream.write("commit %s\n" % branch)
         self.gitStream.write("mark :%s\n" % self.markCounter)
@@ -1428,22 +1521,21 @@ class P4Sync(Command):
 
         self.gitStream.write("committer %s\n" % committer)
 
+        description = self.applyFilter(self.msgFilter, details["desc"])
         self.gitStream.write("data <<EOT\n")
-        self.gitStream.write(details["desc"])
+        self.gitStream.write(description)
         self.gitStream.write("\nEOT\n\n")
-        if len(parent) > 0:
+        if parent:
             if self.verbose:
                 print "parent %s" % parent
             self.gitStream.write("from %s\n" % parent)
-        elif self.branchCommits.has_key(branch):
-            self.gitStream.write("from :%s\n" % self.branchCommits[branch])
 
-        if self.detectBranches and self.isMergeCommit(new_files):
+        if isMergeCommit:
             (parentChange, parentBranch) = self.getMergeParentCommit(new_files, change)
             # if parentBranch is None we probably have to deal with an integration where the source was ignored
             if parentBranch:
-                if self.changeListCommits.has_key(parentChange):
-                    self.gitStream.write("merge :%s\n" % self.changeListCommits[parentChange])
+                if self.changeListCommits.has_key(parentBranch) and self.changeListCommits[parentBranch].has_key(parentChange):
+                    self.gitStream.write("merge :%s\n" % self.changeListCommits[parentBranch][parentChange])
                 else:
                     # need to get change number from git repo - it was imported before
                     commit = self.getGitCommitFromChange(parentBranch, parentChange)
@@ -1457,7 +1549,8 @@ class P4Sync(Command):
                 print "\nfile %s is a strange apple file that forks. Ignoring!" % f['path']
                 continue
 
-            relPath = self.stripRepoPath(f['path'], branchPrefixes)
+            relPath = self.stripRepoPath(f["targetPath"], branchPrefixes)
+
             if f['action'] in self.delete_actions:
                 self.gitStream.write("D %s\n" % relPath)
             else:
@@ -1475,18 +1568,35 @@ class P4Sync(Command):
                 if self.isWindows and f["type"].endswith("text"):
                     data = data.replace("\r\n", "\n")
 
-                self.gitStream.write("M %s inline %s\n" % (mode, relPath))
-                self.gitStream.write("data %s\n" % len(data))
-                self.gitStream.write(data)
-                self.gitStream.write("\n")
+                if data != None:
+                    preFilterDataLen = len(data)
+                else:
+                    preFilterDataLen = 0
+
+                # apply content filter
+                if f["type"].endswith("text"):
+                    data = self.applyContentFilter(self.contentFilter, data)
+
+                if data == None:
+                    errorFile = open("git-p4-errors", "a")
+                    errorFile.write("\n# ### WARNING: data is None for file %s, type %s.\n" % (relPath, f["type"]))
+                    errorFile.write("# Prior to running filter length was: %s. Changelist #%s\n" % (preFilterDataLen, details["change"]))
+                    errorFile.write("# If this happens it might mean that p4 couldn't find the file content or that the file was stored with wrong file type in p4.\n")
+                    errorFile.write("# Try and run: p4 print \"%s#%s\"\n\n" % (f["path"], f["rev"]))
+                    errorFile.close()
+                else:
+                    self.gitStream.write("M %s inline %s\n" % (mode, relPath))
+                    self.gitStream.write("data %s\n" % len(data))
+                    self.gitStream.write(data)
+                    self.gitStream.write("\n")
 
         for f in new_files:
             includeFile = False
             excludeFile = False
-            relPath = self.stripRepoPath(f['path'], branchPrefixes)
+            relPath = self.stripRepoPath(f["targetPath"], branchPrefixes)
             if len(self.clientSpecDirs):
                 for val in self.clientSpecDirs:
-                    if f['path'].startswith(val[0]):
+                    if relPath.startswith(val[0]):
                         if val[1] > 0:
                             includeFile = True
                         else:
@@ -1525,34 +1635,71 @@ class P4Sync(Command):
             self.gitStream.write(": options = %s" % details['options'])
         self.gitStream.write("]\nEOT\n\n")
 
-        self.branchCommits[branch] = self.markCounter
-        self.changeListCommits[change] = self.markCounter
+        localBranch = branch[len(getRefsPrefix(self.importIntoRemotes)):]
+        if not self.changeListCommits.has_key(localBranch):
+            self.changeListCommits[localBranch] = {}
+        self.changeListCommits[localBranch][change] = self.markCounter
         self.markCounter += 2
 
+        if not self.detectBranches:
+            self.commitLabel(details, branch, change)
+
+    def getFilesForLabel(self, label, change):
+        if change == self.lastLabelChange:
+            return self.lastLabelFiles
+
+        labelDetails = label[0]
+        print "Getting files for label %s (change %s)" % (labelDetails["label"], change)
+
+        files = self.p4.p4CmdList("files " +  ' '.join (['"%s@%s"' % (p, change)
+                                            for p in labelDetails["Views"]]))
+
+        filteredFiles = self.applyFilter(self.treeFilter, '\n'.join([info["depotFile"] for info in files])).split('\n')
+
+        labelFiles = []
+        for fileToCheck in filteredFiles:
+            # Check if file (with applied filter and stripped //depot/) matches our branch
+            for depot in self.depotPaths:
+                if fileToCheck.startswith(depot):
+                    fileToCheck = fileToCheck[len(depot):]
+                    break;
+            labelFiles.append(fileToCheck)
+
+        self.lastLabelChange = change
+        self.lastLabelFiles = labelFiles
+        return labelFiles
+
+    def commitLabel(self, details, branch, change):
         if self.labels.has_key(change):
+            epoch = details["time"]
+            author = details["user"]
+            localBranch = branch[len(getRefsPrefix(self.importIntoRemotes)):]
+
             label = self.labels[change]
             labelDetails = label[0]
             labelRevisions = label[1]
-            if self.verbose:
-                print "Change %s is labeled %s" % (change, labelDetails)
 
-            files = self.p4.p4CmdList("files " +  ' '.join (['"%s@%s"' % (p, change)
-                                                for p in labelDetails["Views"]]))
-            cleanedFiles = {}
-            for info in files:
-                cleanedFiles[info["depotFile"]] = info["rev"]
+            files = self.getFilesForLabel(label, change)
+            cleanedFiles = []
+            for fileToCheck in files:
+                # Check if file (with applied filter and stripped //depot/) matches our branch
+                if fileToCheck.startswith(localBranch):
+                    cleanedFiles.append(fileToCheck)
+
+            if len(cleanedFiles) == 0:
+                # Label has no files on our branch
+                return
+
+            if self.verbose:
+                print "Change %s for branch %s is labeled %s" % (change, localBranch, labelDetails)
 
             if len(cleanedFiles) == len(labelRevisions) or self.fuzzyTags:
 
-                if self.fuzzyTags and len(cleanedFiles) != len(labelRevisions):
-                    for fileInLabel in labelRevisions:
-                        if not cleanedFiles.has_key(fileInLabel) or cleanedFiles[fileInLabel] != labelRevisions[fileInLabel]:
-                            print ("Tag %s does not match with change %s: revision of file %s different" 
-                                   % (labelDetails["label"], change, fileInLabel))
-                            return
-
                 if cleanedFiles == labelRevisions or self.fuzzyTags:
-                    self.gitStream.write("tag tag_%s\n" % labelDetails["label"])
+                    if self.detectBranches:
+                        self.gitStream.write("tag tag_%s_%s\n" % (localBranch, labelDetails["label"]))
+                    else:
+                        self.gitStream.write("tag tag_%s\n" % labelDetails["label"])
                     self.gitStream.write("from %s\n" % branch)
 
                     owner = labelDetails["Owner"]
@@ -1560,7 +1707,7 @@ class P4Sync(Command):
                     if author in self.users:
                         tagger = "%s %s %s" % (self.users[owner], epoch, self.tz)
                     else:
-                        tagger = "%s <a@b> %s %s" % (owner, epoch, self.tz)
+                        tagger = "%s <%s> %s %s" % (owner, owner, epoch, self.tz)
                     self.gitStream.write("tagger %s\n" % tagger)
                     self.gitStream.write("data <<EOT\n")
                     self.gitStream.write(labelDetails["Description"])
@@ -1601,7 +1748,7 @@ class P4Sync(Command):
 
     def getMergeParentCommit(self, files, changeNo):
         # find and return the highest changelist number that this merge is based on
-        branches = p4BranchesInGit(self.importIntoRemotes)
+        branches = self.createdBranches
         highestParentChange = 0
         parentBranch = None
         for info in files:
@@ -1615,8 +1762,13 @@ class P4Sync(Command):
                 newChange = int(parentFileLog[0]["change0"])
             else:
                 continue
-            # strip of // from the  beginning
-            tmpBranch = tmpBranch[2:]
+            # apply filter
+            tmpBranch = self.applyFilter(self.treeFilter, tmpBranch)
+            # strip of //depot/ from the beginning
+            for depot in self.depotPaths:
+                if tmpBranch.startswith(depot):
+                    tmpBranch = tmpBranch[len(depot):]
+                    break;
             for branch in branches:
                 if tmpBranch.startswith(branch):
                     if branch != parentBranch and parentBranch:
@@ -1877,12 +2029,14 @@ class P4Sync(Command):
         sourceRef = self.gitRefForBranch(sourceBranch)
         #print "source " + sourceBranch
 
-        branchParentChange = int(self.p4.p4Cmd("changes -m 1 %s/...@1,%s" % (sourceDepotPath, firstChange))["change"])
-        #print "branch parent: %s" % branchParentChange
-        gitParent = self.gitCommitByP4Change(sourceRef, branchParentChange)
-        if len(gitParent) > 0:
-            self.initialParents[self.gitRefForBranch(branch)] = gitParent
-            #print "parent git commit: %s" % gitParent
+        sourceChanges = self.p4.p4Cmd("changes -m 1 %s/...@1,%s" % (sourceDepotPath, firstChange))
+        if sourceChanges.has_key("change"):
+            branchParentChange = int(sourceChanges["change"])
+            #print "branch parent: %s" % branchParentChange
+            gitParent = self.gitCommitByP4Change(sourceRef, branchParentChange)
+            if len(gitParent) > 0:
+                self.initialParents[self.gitRefForBranch(branch)] = gitParent
+                #print "parent git commit: %s" % gitParent
 
         self.importChanges(changes)
         return True
@@ -1923,14 +2077,16 @@ class P4Sync(Command):
                             if fullBranch not in self.p4BranchesInGit:
                                 if not self.silent:
                                     print("\n    Importing new branch %s" % fullBranch);
-                                if self.importNewBranch(branch, change - 1):
+                                if self.importNewBranch(branch, change - 1) or parent not in self.createdBranches:
                                     parent = ""
                                     self.p4BranchesInGit.append(fullBranch)
                                 if not self.silent:
                                     print("\n    Resuming with change %s" % change);
 
-                            if self.verbose:
-                                print "parent determined through known branches: %s" % parent
+                            # We don't want to set a parent for a new branch since that would result in a tree
+                            # that starts out with the parent branch. We want to start with an empty tree since
+                            # we list all files that should go into the branch.
+                            parent = ""
 
                     branch = self.gitRefForBranch(branch)
                     parent = self.gitRefForBranch(parent)
@@ -1943,8 +2099,17 @@ class P4Sync(Command):
                         del self.initialParents[branch]
 
                     self.branch = branch
-                    self.commit(description, filesForCommit, branch, [branchPrefix], parent, self.initialNoteParent)
+                    self.commit(description, filesForCommit, branch, [branchPrefix], parent, self.initialNoteParent, False)
                     self.initialNoteParent = ""
+
+                # Add labels for this commit. A label may affect a branch even though the current
+                # change doesn't touch any files in that branch
+                p4Branches = p4BranchesInGit(self.importIntoRemotes)
+                for branch in p4Branches:
+                    self.commitLabel(description, self.gitRefForBranch(branch), change)
+                for branch in self.createdBranches:
+                    if not branch in p4Branches:
+                        self.commitLabel(description, self.gitRefForBranch(branch), change)
             else:
                 files = self.extractFilesFromCommit(description)
                 if (cnt == 1 and restartImport):
@@ -2108,8 +2273,7 @@ class P4Sync(Command):
         return revision
 
     def detectP4Branches(self):
-        ## FIXME - what's a P4 projectName ?
-        self.projectName = self.guessProjectName()
+        self.projectName = ""
 
         if self.hasOrigin:
             self.getBranchMappingFromGitBranches()
@@ -2125,10 +2289,21 @@ class P4Sync(Command):
                 b = b[len(self.projectName):]
             self.createdBranches.add(b)
 
+    def cleanup(self):
+        if self.contentFilterDir:
+            system("rm -rf %s" % self.contentFilterDir)
 
     def run(self, args):
         if self.debug:
             self.verbose = True
+
+        if self.contentFilter:
+            # create temporary directory if we have a content filter
+            self.contentFilterDir = tempfile.mkdtemp()
+            env = os.environ.copy()
+            env["GIT_DIR"] = self.contentFilterDir
+            subprocess.Popen("git init .", cwd=self.contentFilterDir, shell=True, env=env)
+            subprocess.Popen('git config core.whitespace "blank-at-eol,space-before-tab,indent-with-non-tab,blank-at-eof,trailing-space,cr-at-eol,tabwidth=4"', cwd=self.contentFilterDir, shell=True, env=env)
             
         # map from branch depot path to parent branch
         self.hasOrigin = originP4BranchesExist()
@@ -2272,6 +2447,7 @@ class P4Sync(Command):
             self.gitStream.flush()
 
         except IOError:
+            self.cleanup()
             die("fast-import failed")
 
         if self.fileDump:
@@ -2283,8 +2459,10 @@ class P4Sync(Command):
             importProcess.communicate()
 
             if importProcess.returncode != 0:
+                self.cleanup()
                 die("fast-import failed")
 
+        self.cleanup()
         return True
 
 class P4Rebase(P4Sync):
